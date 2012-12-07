@@ -9,6 +9,7 @@
 namespace Import;
 
 use Config;
+use DB;
 use Lang;
 use PHPExcel;
 use PHPExcel_Reader_Excel2007;
@@ -51,9 +52,19 @@ class Import {
     private $_messages = [];
 
     /**
+     * 字段标题映射
+     */
+    private $_maps = [];
+
+    /**
      * 当场景中有case才使用
      */
     private $_index = null;
+
+    /**
+     * 当场景有case才使用
+     */
+    private $_key = null;
 
     /**
      * 导入构造函数
@@ -98,6 +109,7 @@ class Import {
                 }
 
                 $this->_rules = array_combine($this->_fields, $rules);  // 验证规则
+                $this->_maps  = array_combine($this->_fields, $this->_headers);  // 映射
 
             } else {
                 $this->_exception(__('import::import.no_import_setting'));
@@ -116,6 +128,9 @@ class Import {
             } else {
                 $this->_exception(__('import::import.no_storage_setting'));
             }
+
+            // 初始化转换
+            Config::set('import::import.transduce', []);
 
         } else {
             $message = sprintf(__('import::import.no_config'), $config);
@@ -153,16 +168,15 @@ class Import {
      */
     private function _initScenes() {
         // 场景设置
-        if( isset($this->_scenes['case'] ) && $case = $this->_scenes['case']) {
-            $this->_rules[$case] = $this->_require($this->_rules[$case]);
-            $this->_index = array_search($case, $this->_fields);
+        if( isset($this->_scenes['case'] ) && $this->_case = $this->_scenes['case']) {
+            $this->_rules[$this->_case] = $this->_require($this->_rules[$this->_case]);
+            $this->_index = array_search($this->_case, $this->_fields);
+            $this->_key   = isset($this->_scenes['key']) ? $this->_scenes['key'] : null;
         } elseif(!empty($this->_scenes)) {
             foreach($this->_scenes as $scenes) {
                 $this->_rules[$scene] = $this->_require($rules[$scenes]);
             }
         }
-
-    
     }
 
     /**
@@ -189,13 +203,14 @@ class Import {
         if($headers != $this->_headers) $this->_exception(__('import::import.not_a_standard_file'));
 
         // 数据验证
-        $this->_messages = Config::get('import::error'); // 验证提示
+        $this->_messages = Config::get('import::error');  // 验证提示
+        Config::set('import::import.maps', $this->_maps); // 映射 
         foreach($this->_data as $index => $data) {
 
             $current_row = $index + 2;
 
             // 验证场景
-            if($this->_index) {
+            if(! is_null($this->_index) ) {
                 if(in_array($data[$this->_index], array_keys($this->_scenes['requires']))) {
                     $requires = $this->_scenes['requires'][$data[$this->_index]];
                 } else {
@@ -205,36 +220,188 @@ class Import {
                 $requires = $this->_scenes;
             }
 
-            foreach ($requires as $require) {
+            foreach($requires as $require) {
                 if( isset($this->_rules[$require]) ) {
                     $this->_rules[$require] = $this->_require($this->_rules[$require]);
                 } else {
-                    $this->_exception(sprintf('import::import.not_have_this_scene'), $require);
+                    $message = sprintf(__('import::import.not_have_this_scene'), $require);
+                    $this->_exception($message);
                 }
+            }
+
+            foreach($this->_rules as $key => $rule) {
+                if(empty($rule)) unset($this->_rules[$key]);
             }
 
             // 数据
             $data = array_combine($this->_fields, $data);
             if(! $data) $this->_rowException($current_row, __('import::import.data_length_not_match'));
             
+            // 验证处理
+            Config::set('import::import.current_row', $current_row);
             $valid = Validator::make($data, $this->_rules, $this->_messages);
             if( $valid->fails() ) {
                 $messages = str_replace( ' ', '_', $valid->errors->first() );
                 $this->_rowException( $current_row, str_replace($this->_fields, $this->_headers, $messages) );
             } else {
+                $data = array_merge($data, Config::get('import::import.transduce'));
                 // 存储
-            }
-            die;
+                if(! is_null($this->_key) && ! is_null($this->_case) ) {
+                    // var_dump($data[$this->_case] == $this->_key); die;
+                    // 如果是主要版本
+                    if($data[$this->_case] == $this->_key) {
 
+                        /**
+                         *  one overwirte = true
+                         */
+                        foreach($this->_storage as $table => $fields) {
+
+                            // 如果是 one to many
+                            if(isset($fields['relation_tables'])) {
+
+                                $table_data = $this->_data($fields['fields'], $data);
+                                $exists_id = $this->_data_exists($table, $fields['uniques'], $data);
+
+                                if($exists_id) {
+                                    DB::table($table)->where('id', '=', $exists_id)->update($table_data);
+                                    $data[$fields['relation_field']] = $exists_id;
+                                    $this->_import_tables($fields['relation_tables'], $fields['uniques'], $fields['relation_field'], $data);
+                                } else {
+                                    $$fields['relation_field'] = DB::table($table)->insert_get_id($table_data);
+                                    $data[$fields['relation_field']] = $$fields['relation_field'];
+                                    $this->_import_tables($fields['relation_tables'], $fields['uniques'], $fields['relation_field'], $data);
+                                }
+
+                            } else {
+                                $this->_fileException('暂时不支持');
+                                return false;
+                            }
+                        }
+                    } else { // 非主要版本
+                    
+                    
+                    }
+                }
+            }
         }
-        die;
+    }
+
+    /**
+     * import relation_tables
+     */
+    private function _import_tables($tables, $uniques, $relation, $source, $f = 0) {
+        foreach($tables as $table => $fields) {
+            $uniques[$relation] = $table;
+            $data = $this->_data($fields, $source, $f);
+            foreach($data as $key => $value) {
+                if(is_array($value)) {
+                    foreach($value as $v) {
+                        $data[$key] = $v;
+                        $new_data[] = $data;
+                    }
+                    $new_tables = [$table => $fields];
+                    foreach($new_data as $new_datum) {
+                        $this->_import_tables($new_tables, $uniques, $relation, $new_datum, 1);
+                    }
+
+                    /*
+                     * 跳出上两级循环
+                     */
+                    break 2;
+                }
+            }
+
+            $exists_id = $this->_data_exists($table, $uniques, $source, $f);
+            if($exists_id) {
+                DB::table($table)->update($data);
+            } else {
+                DB::table($table)->insert($data);
+            }
+        }
+    }
+
+    /**
+     * 设置数据
+     *
+     * @param: $fields array 字段名
+     * @param: $source array 数据源
+     *
+     * return array
+     */
+    private function _data($fields, $source, $f=0) {
+        foreach($fields as $key => $value) {
+            if(preg_match('/^\d+$/', $key)) {
+                if($source[$value]) $data[$value] = $source[$value];
+            } else {
+                $data[$key] = $this->_value($value);
+            }
+        }
+
+        return $data;
+    }
+
+
+    /**
+     * 转换data中的值
+     *
+     */
+    private function _value($value) {
+        switch ($value) {
+            case 'datetime':
+                $result = date('Y-m-d H:i:s');
+                break;
+            
+            default:
+                $result = $value;
+                break;
+        }
+
+        return $result;
+    }
+
+    /**
+     * 获取属于指定表的唯一字段
+     *
+     * @param: $table   string 表名
+     * @param: $uniques 配置文件的唯一设置
+     *
+     * return array
+     */
+    private function _unique($table, $uniques, $f=0) {
+        $result = [];
+        foreach($uniques as $key => $value) {
+            if($value == $table) $result[] = $key;
+        }
+
+        return $result;
+    }
+
+    /**
+     * 一表唯一性 (one-to-many)
+     *
+     * @param: $table    string 表名
+     * @param: $uniques  array  唯一性配置
+     * @param: $source   array  插入的数据
+     *
+     * return integer
+     */
+    private function _data_exists($table, $uniques, $source, $f=0) {
+        $uniques = $this->_unique($table, $uniques, $f);
+
+        $query = DB::table($table);
+        foreach($uniques as $unique) {
+            $query = $query->where($unique, '=', $source[$unique]);
+        }
+
+        return $query->only('id');
     }
 
     /**
      * 过滤空数据
      *
+     * @param: $data array 读取Excel的row记录
      *
-     *
+     * return array
      */
     private function _trim($data) {
         $count = count($this->_fields);
@@ -253,8 +420,6 @@ class Import {
         return $data;
     }
 
-    
-
     /**
      * 抛出导入包异常
      *
@@ -264,7 +429,6 @@ class Import {
      */
     private function _exception($message) {
         Throw new ImportException($message);
-        
     }
 
     /**

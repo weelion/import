@@ -10,23 +10,28 @@
 namespace Import;
 
 use Config;
-use DB;
 
-class Validator extends Laravel\Validator {
+class Validator extends \Validator {
 
     /**
      * 验证是否转换成功
      *
-     * @param: $attribute  属性名称
-     * @param: &$value     值引用
-     * @param: $parameters 参数表名字段等数据
+     * @param: $attribute  string 字段名称
+     * @param: &$value     string 值引用
+     * @param: $parameters array  参数表名字段等数据
      *
      * return bool
      */
-    public function validate_transduce($attribute, &$value, $parameters) {
-    
-    }
+    protected function validate_transduce($attribute, $value, $parameters) {
 
+        $model = array_shift($parameters);
+        $class = 'Import\Transduce_'.ucfirst($model);
+        $transpose = new $class();
+        $result = $transpose->result($attribute, $value, $parameters);
+        Config::set('import::import.transduce.'.$attribute, $value);
+
+        return $result;
+    }
 }
 
 ?>

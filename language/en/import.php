@@ -9,6 +9,8 @@ return [
     'not_a_standard_file' => '不是一个标准的导入文件。',
     'not_have_this_scene' => '没有%s这个场景。',
     'data_length_not_match' => '数据记录不符合。',
+    'table_field_is_not_exists' => '%s“%s”不存在。',
+    'image_is_not_exists' => '%s“%s”还没有上传。',
     'current_row' => '第%s行',
 ];
 
